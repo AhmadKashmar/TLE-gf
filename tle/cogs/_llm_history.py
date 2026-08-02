@@ -1,17 +1,14 @@
 """Channel history collection for ``;llm``.
 
-Adapted from the approach in MKLOL/TLE-gf#10 (AhmadKashmar): rather than only
-ever seeing the message you replied to, a question that depends on the
-conversation pulls a window of it. Two shapes:
+The answer pipeline now fetches a fixed candidate set — normally the latest
+200 usable messages in the current channel or Discord thread — and lets a cheap
+Gemini pass choose the semantic conversation boundary. Timestamps remain model
+features, not hard cutoffs. Reply targets and their resolved ancestor chain are
+pinned into the candidate set so an older referenced exchange cannot be pushed
+out by newer chatter.
 
-* **recent** — the last N messages before the command, within a time window,
-  for questions like "what were they arguing about?"
-* **reply window** — messages around a specific replied-to message, so a reply
-  carries the exchange it sat in rather than one isolated line.
-
-Both are time-boxed as well as count-boxed. A channel that was quiet for a day
-should not drag yesterday's conversation into today's answer just because the
-message count is low.
+The older time-window collectors remain for compatibility and focused tests,
+but the live answer path uses :func:`collect_candidates`.
 
 Collection is deliberately conservative about what it forwards: author display
 name, text, and attachment *filenames*. Attachment contents are handled
@@ -30,6 +27,12 @@ logger = logging.getLogger(__name__)
 _MAX_MESSAGE_CHARS = 600
 # Whole-transcript budget, so a busy channel cannot blow up the prompt.
 _MAX_TRANSCRIPT_CHARS = 12000
+# Larger budget used only after Gemini has selected the semantic boundary.
+_MAX_SELECTED_TRANSCRIPT_CHARS = 200000
+# Compact copy sent to Gemini for boundary selection. All candidate records
+# should fit, so this is intentionally larger than the final answer transcript.
+_MAX_BOUNDARY_MESSAGE_CHARS = 320
+_MAX_BOUNDARY_TRANSCRIPT_CHARS = 250000
 # Discord applies ``limit`` before we can filter bot/empty messages. Scan a
 # bounded multiple so nearby useful messages are not crowded out.
 _HISTORY_SCAN_FACTOR = 3
@@ -97,6 +100,153 @@ def _speaker_key(message):
     if author_id is not None:
         return ('id', author_id)
     return ('name', getattr(author, 'display_name', None))
+
+
+def _same_scope(left, right):
+    """Whether two messages belong to the same guild/channel or thread."""
+    for attribute in ('channel', 'guild'):
+        left_id = getattr(getattr(left, attribute, None), 'id', None)
+        right_id = getattr(getattr(right, attribute, None), 'id', None)
+        if left_id is not None and right_id is not None and left_id != right_id:
+            return False
+    return True
+
+
+def _not_after(message, target):
+    message_at = getattr(message, 'created_at', None)
+    target_at = getattr(target, 'created_at', None)
+    if message_at is None or target_at is None:
+        return True
+    try:
+        return message_at <= target_at
+    except TypeError:
+        return True
+
+
+async def collect_reply_chain(target, max_depth=32):
+    """Resolve reply ancestors plus ``target``, oldest first.
+
+    Discord.py often exposes ``reference.resolved`` for the immediate parent,
+    but it is not guaranteed to be populated. When it is missing, fetch the
+    referenced message by ID from the same channel/thread. Deleted, forbidden,
+    cyclic, cross-scope, and future-looking references terminate the walk.
+    """
+    if target is None:
+        return []
+    chain = [target]
+    seen = {_message_token(target)}
+    current = target
+    for _ in range(max(0, int(max_depth))):
+        reference = getattr(current, 'reference', None)
+        if reference is None:
+            break
+        parent = getattr(reference, 'resolved', None)
+        parent_id = getattr(reference, 'message_id', None)
+        if parent is None and parent_id is not None:
+            channel = (getattr(current, 'channel', None)
+                       or getattr(target, 'channel', None))
+            fetch_message = getattr(channel, 'fetch_message', None)
+            if callable(fetch_message):
+                try:
+                    parent = await fetch_message(parent_id)
+                except Exception:  # noqa: BLE001 — deleted/forbidden/missing
+                    logger.info(
+                        'Could not resolve reply ancestor message id=%s',
+                        parent_id, exc_info=True)
+                    break
+        if parent is None:
+            break
+        token = _message_token(parent)
+        if token in seen:
+            break
+        seen.add(token)
+        if not _same_scope(parent, target) or not _not_after(parent, target):
+            break
+        if _is_usable(parent, include_bot=True):
+            chain.append(parent)
+        current = parent
+    chain.sort(key=_chronological_key)
+    return chain
+
+
+def resolved_reply_chain(target, max_depth=32):
+    """Compatibility helper using only already-resolved reply objects."""
+    if target is None:
+        return []
+    chain = [target]
+    seen = {_message_token(target)}
+    current = target
+    for _ in range(max(0, int(max_depth))):
+        parent = getattr(getattr(current, 'reference', None), 'resolved', None)
+        if parent is None:
+            break
+        token = _message_token(parent)
+        if token in seen:
+            break
+        seen.add(token)
+        if not _same_scope(parent, target) or not _not_after(parent, target):
+            break
+        if _is_usable(parent, include_bot=True):
+            chain.append(parent)
+        current = parent
+    chain.sort(key=_chronological_key)
+    return chain
+
+
+async def collect_candidates(channel, before=None, limit=200,
+                             bot_user_id=None, pinned=None):
+    """Collect the latest usable raw messages, oldest first.
+
+    Unlike :func:`collect_recent`, ``limit`` means actual messages, not speaker
+    turns, and there is no age or inactivity cutoff. Bot messages are included
+    because previous assistant answers and utility-bot output can be part of a
+    group-chat exchange. ``pinned`` messages (normally a reply target and its
+    ancestors) are retained even when they are older than the latest ``limit``.
+    The returned set never exceeds ``limit``.
+    """
+    wanted = max(0, int(limit))
+    if wanted == 0:
+        return []
+
+    recent = []
+    try:
+        async for message in channel.history(
+                limit=wanted * _HISTORY_SCAN_FACTOR, before=before,
+                oldest_first=False):
+            if not _is_usable(message, bot_user_id, include_other_bots=True,
+                              include_bot=True):
+                continue
+            recent.append(message)
+            if len(recent) >= wanted:
+                break
+    except Exception:  # noqa: BLE001 — missing Read Message History, etc.
+        logger.exception('Could not read channel history for ;llm')
+        recent = []
+    recent.reverse()
+
+    pinned_messages = [
+        message for message in (pinned or [])
+        if message is not None and _same_scope(message, before or message)
+        and _is_usable(message, bot_user_id, include_other_bots=True,
+                       include_bot=True)
+    ]
+    pinned_tokens = {_message_token(message) for message in pinned_messages}
+
+    # Pinned objects overwrite equivalent history objects so identity-based
+    # focus marking continues to use the exact resolved message from Discord.
+    merged = {_message_token(message): message for message in recent}
+    merged.update({_message_token(message): message for message in pinned_messages})
+    ordered = sorted(merged.values(), key=_chronological_key)
+    if len(ordered) <= wanted:
+        return ordered
+
+    kept_tokens = set(pinned_tokens)
+    for message in reversed(ordered):
+        if len(kept_tokens) >= wanted:
+            break
+        kept_tokens.add(_message_token(message))
+    return [message for message in ordered
+            if _message_token(message) in kept_tokens]
 
 
 async def collect_recent(channel, before=None, limit=50, window_seconds=600,
@@ -388,7 +538,7 @@ def _reply_later_boundary(target, until, window_seconds):
 
 
 def format_transcript(messages, focus=None, structured=False,
-                      requester_id=None):
+                      requester_id=None, max_chars=None):
     """Render collected messages as a plain transcript for the prompt.
 
     ``focus`` (the replied-to message) is marked so the model knows which line
@@ -396,15 +546,18 @@ def format_transcript(messages, focus=None, structured=False,
     by the live LLM pipeline while the legacy rendering remains available to
     callers that only need a human-readable preview.
     """
+    budget = (_MAX_TRANSCRIPT_CHARS if max_chars is None
+              else max(1, int(max_chars)))
     rendered = []
     focus_position = None
+    focus_token = _message_token(focus) if focus is not None else None
     for message in messages or []:
         line = _render_message(
             message, focus, structured=structured,
             requester_id=requester_id)
         if line is None:
             continue
-        if message is focus:
+        if focus_token is not None and _message_token(message) == focus_token:
             focus_position = len(rendered)
         rendered.append(line)
     if not rendered:
@@ -414,7 +567,7 @@ def format_transcript(messages, focus=None, structured=False,
         start, end = len(rendered) - 1, len(rendered) - 1
         while start > 0:
             candidate = _compose_transcript(rendered, start - 1, end)
-            if len(candidate) > _MAX_TRANSCRIPT_CHARS:
+            if len(candidate) > budget:
                 break
             start -= 1
         return _compose_transcript(rendered, start, end)
@@ -429,7 +582,7 @@ def format_transcript(messages, focus=None, structured=False,
         for side in sides:
             if side == 'left' and left_open:
                 candidate = _compose_transcript(rendered, start - 1, end)
-                if len(candidate) <= _MAX_TRANSCRIPT_CHARS:
+                if len(candidate) <= budget:
                     start -= 1
                     prefer_left = False
                     added = True
@@ -437,7 +590,7 @@ def format_transcript(messages, focus=None, structured=False,
                 left_open = False
             elif side == 'right' and right_open:
                 candidate = _compose_transcript(rendered, start, end + 1)
-                if len(candidate) <= _MAX_TRANSCRIPT_CHARS:
+                if len(candidate) <= budget:
                     end += 1
                     prefer_left = True
                     added = True
@@ -450,18 +603,45 @@ def format_transcript(messages, focus=None, structured=False,
     return _compose_transcript(rendered, start, end)
 
 
-def _render_message(message, focus, structured=False, requester_id=None):
+
+def format_boundary_transcript(messages, focus=None, requester_id=None):
+    """Render every candidate as compact indexed JSON for Gemini selection."""
+    rendered = []
+    for index, message in enumerate(messages or []):
+        line = _render_message(
+            message, focus, structured=True, requester_id=requester_id,
+            body_limit=_MAX_BOUNDARY_MESSAGE_CHARS)
+        if line is None:
+            continue
+        record = json.loads(line)
+        record['index'] = index
+        rendered.append(json.dumps(
+            record, ensure_ascii=False, separators=(',', ':')))
+    transcript = '\n'.join(rendered)
+    if len(transcript) > _MAX_BOUNDARY_TRANSCRIPT_CHARS:
+        # This should be unreachable with the configured 200-message/320-char
+        # budgets. Fail closed rather than silently presenting wrong indices.
+        raise ValueError('Boundary transcript exceeded its configured budget')
+    return transcript
+
+
+def _render_message(message, focus, structured=False, requester_id=None,
+                    body_limit=_MAX_MESSAGE_CHARS):
     """Render one bounded transcript entry, or ``None`` when empty."""
     author = getattr(getattr(message, 'author', None), 'display_name', None) \
         or 'unknown'
     author = _one_line(redact_secrets(author), _MAX_AUTHOR_CHARS)
     body = redact_secrets(message_text(message).strip())
+    focus_token = _message_token(focus) if focus is not None else None
+    is_focus = (focus_token is not None
+                and _message_token(message) == focus_token)
     if not body:
-        if message is not focus:
+        if not is_focus:
             return None
         body = '(empty message)'
-    if len(body) > _MAX_MESSAGE_CHARS:
-        body = body[:_MAX_MESSAGE_CHARS - 1] + '…'
+    body_limit = max(1, int(body_limit))
+    if len(body) > body_limit:
+        body = body[:body_limit - 1] + '…'
 
     if structured:
         message_author = getattr(message, 'author', None)
@@ -480,13 +660,13 @@ def _render_message(message, focus, structured=False, requester_id=None):
                 requester_id is not None and author_id is not None
                 and str(author_id) == str(requester_id)),
             'reply_to': reply_id,
-            'focus': message is focus,
+            'focus': is_focus,
             'content': body,
         }, ensure_ascii=False, separators=(',', ':'))
 
     marker = (' \N{LEFTWARDS ARROW}\N{VARIATION SELECTOR-16} (the message '
               'being replied to — the one being asked about)'
-              if message is focus else '')
+              if is_focus else '')
     return f'{author}: {body}{marker}'
 
 

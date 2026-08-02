@@ -212,6 +212,25 @@ async def ask_grok(cog, ctx, question):
             '`XAI_API_KEY` and restart, or use `;llm grokkeys` in a private '
             'owner-only channel.'))
         return
+
+    # Grok answers still use Gemini for the shared semantic-boundary pass.
+    # Direct/privacy-disabled calls do not need this dependency.
+    boundary_pool = cog._get_pool()
+    policy = cog._context_policy(ctx)
+    needs_boundary = not (
+        policy == 'off'
+        or controls.mode == llm_context.MODE_DIRECT
+        or (policy == 'explicit' and controls.mode is None
+            and referenced is None)
+    )
+    if needs_boundary and (
+            boundary_pool.key_count() == 0 or not constants.LLM_MODELS):
+        await ctx.send(embed=discord_common.embed_alert(
+            'Grok context selection requires Gemini. Configure '
+            '`GEMINI_API_KEYS` and at least one `LLM_MODELS` entry, or use '
+            '`+direct` to ask without channel history.'))
+        return
+
     attachments = llm_context.select_image_attachments(
         [referenced, ctx.message], constants.LLM_MAX_IMAGES,
         constants.LLM_MAX_IMAGE_BYTES,
@@ -242,8 +261,8 @@ async def ask_grok(cog, ctx, question):
                 str(reservation_id),
                 getattr(reservation_id, 'retry_at', None), user_rate)
         mode, window, explicit = await _prepare_context(
-            cog, ctx, 'xai', pool, question, referenced, attachments,
-            controls, router_stats)
+            cog, ctx, 'xai', boundary_pool, question, referenced,
+            attachments, controls, router_stats)
         profiles = llm_profiles.build_profiles(
             db(), ctx.guild.id, ctx.author, [referenced, *window],
             focused=referenced)
@@ -337,32 +356,50 @@ async def _send_answer_embeds(ctx, embeds):
 
 async def _prepare_context(cog, ctx, provider, pool, question, referenced,
                            attachments, controls, router_stats):
+    """Fetch candidates, then let Gemini choose the semantic start boundary."""
     policy = cog._context_policy(ctx)
     explicit = controls.mode is not None or policy != 'auto'
-    if policy == 'off':
-        mode, force_direct = llm_context.MODE_DIRECT, True
-    elif controls.mode is not None:
-        mode = llm_context.apply_mode_override(
-            llm_context.MODE_DIRECT, controls, is_reply=referenced is not None)
-        force_direct = controls.mode == llm_context.MODE_DIRECT
-    elif policy == 'explicit':
-        mode = (llm_context.MODE_REPLY_CHAIN if referenced is not None
-                else llm_context.MODE_DIRECT)
-        force_direct = referenced is None
+
+    force_direct = (
+        policy == 'off'
+        or controls.mode == llm_context.MODE_DIRECT
+        or (policy == 'explicit' and controls.mode is None
+            and referenced is None)
+    )
+    if force_direct:
+        return llm_context.MODE_DIRECT, [], explicit
+
+    candidates = await llm_pipeline.gather_candidates(
+        ctx, referenced, bot_user_id=cog._bot_user_id(),
+        message_limit=controls.message_limit)
+    local_hint = llm_context.local_mode_hint(
+        question, is_reply=referenced is not None,
+        has_current_images=bool(attachments))
+    force_context = (
+        referenced is not None
+        or controls.mode == llm_context.MODE_CONTEXT
+        or local_hint in (
+            llm_context.MODE_CONTEXT, llm_context.MODE_REPLY_CHAIN)
+    )
+    # Gemini selector usage belongs to Gemini telemetry only. In particular,
+    # do not count or bill these tokens as xAI usage on Grok requests.
+    selector_stats = router_stats if provider == 'gemini' else None
+    start_index = await llm_pipeline.select_boundary(
+        pool, question, candidates, referenced=referenced,
+        session=cog._get_session(), stats=selector_stats,
+        force_context=force_context,
+        has_current_images=bool(attachments),
+        author_name=getattr(ctx.author, 'display_name', None),
+        author_id=getattr(ctx.author, 'id', None),
+        sent_at=getattr(ctx.message, 'created_at', None))
+    window = llm_pipeline.apply_boundary(
+        candidates, start_index, referenced=referenced)
+    if referenced is not None:
+        mode = llm_context.MODE_REPLY_CHAIN
+    elif window:
+        mode = llm_context.MODE_CONTEXT
     else:
-        classifier = (llm_pipeline.classify_grok if provider == 'xai'
-                      else llm_pipeline.classify)
-        mode = await classifier(
-            pool, question, referenced is not None,
-            session=cog._get_session(), stats=router_stats,
-            author_name=getattr(ctx.author, 'display_name', None),
-            author_id=getattr(ctx.author, 'id', None),
-            sent_at=getattr(ctx.message, 'created_at', None),
-            has_current_images=bool(attachments))
-        force_direct = False
-    window = await llm_pipeline.gather(
-        ctx, mode, referenced, bot_user_id=cog._bot_user_id(),
-        message_limit=controls.message_limit, force_direct=force_direct)
+        mode = llm_context.MODE_DIRECT
     return mode, window, explicit
 
 

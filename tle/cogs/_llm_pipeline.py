@@ -1,14 +1,12 @@
-"""Two-stage request pipeline for ``;llm``: route, then answer.
+"""LLM context selection and final prompt construction.
 
-Stage one resolves replies and obvious history requests locally, then asks a
-cheap model only for genuinely ambiguous questions. Stage two collects the
-chosen conversation window and builds the final prompt. Keeping this out of
-the cog leaves the cog to commands and Discord I/O.
-
-When needed, Gemini routing is charged to the *cheapest* model in the ladder;
-Grok routes through xAI with low reasoning and a small output cap.
+The live path fetches a fixed candidate set and asks the cheapest Gemini
+model for a structured semantic start boundary. The same selector is used
+before Gemini and Grok answers. Older classifier/window helpers remain for
+compatibility, but no temporal cutoff controls the live answer path.
 """
 import asyncio
+import json
 import logging
 
 from tle import constants
@@ -31,6 +29,16 @@ _CLASSIFIER_MAX_TOKENS = 512
 _CLASSIFIER_SCHEMA = {
     'type': 'STRING',
     'enum': [llm_context.MODE_DIRECT, llm_context.MODE_CONTEXT],
+}
+
+
+_BOUNDARY_MAX_TOKENS = 256
+_BOUNDARY_SCHEMA = {
+    'type': 'OBJECT',
+    'properties': {
+        'start_index': {'type': 'INTEGER'},
+    },
+    'required': ['start_index'],
 }
 
 
@@ -132,6 +140,142 @@ async def classify_grok(pool, question, is_reply, session=None, stats=None,
     return mode
 
 
+
+async def gather_candidates(ctx, referenced, bot_user_id=None,
+                            message_limit=None):
+    """Fetch a fixed raw-message candidate set without temporal heuristics."""
+    limit = _bounded_message_limit(
+        message_limit, 200)
+    pinned = await llm_history.collect_reply_chain(referenced)
+    candidates = await llm_history.collect_candidates(
+        ctx.channel, before=ctx.message, limit=limit,
+        bot_user_id=bot_user_id, pinned=pinned)
+    if not candidates:
+        logger.warning(
+            'LLM gathered no boundary candidates (is_reply=%s) — check Read '
+            'Message History permission', referenced is not None)
+    return candidates
+
+
+def _focus_index(candidates, referenced):
+    if referenced is None:
+        return None
+    token = llm_history._message_token(referenced)
+    for index, message in enumerate(candidates):
+        if llm_history._message_token(message) == token:
+            return index
+    return None
+
+
+def _reply_chain_start_index(candidates, referenced):
+    """Earliest available ancestor index that a reply may not cut away."""
+    focus_index = _focus_index(candidates, referenced)
+    if focus_index is None:
+        return None
+    by_id = {}
+    for index, message in enumerate(candidates):
+        message_id = getattr(message, 'id', None)
+        if message_id is not None:
+            by_id[str(message_id)] = index
+    required = focus_index
+    current = referenced
+    seen = set()
+    while current is not None:
+        token = llm_history._message_token(current)
+        if token in seen:
+            break
+        seen.add(token)
+        reference = getattr(current, 'reference', None)
+        parent_id = getattr(reference, 'message_id', None)
+        parent = getattr(reference, 'resolved', None)
+        if parent_id is None and parent is not None:
+            parent_id = getattr(parent, 'id', None)
+        if parent_id is None:
+            break
+        parent_index = by_id.get(str(parent_id))
+        if parent_index is None:
+            break
+        required = min(required, parent_index)
+        current = candidates[parent_index]
+    return required
+
+
+def parse_boundary(raw, count, focus_index=None):
+    """Validate Gemini's boundary, preserving any required reply prefix."""
+    if count <= 0:
+        return -1
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        start = int(payload['start_index'])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        start = 0
+    if start < -1 or start >= count:
+        start = 0
+    if focus_index is not None and (start == -1 or start > focus_index):
+        start = focus_index
+    return start
+
+
+async def select_boundary(pool, question, candidates, referenced=None,
+                          session=None, stats=None, force_context=False,
+                          has_current_images=False, author_name=None,
+                          author_id=None, sent_at=None):
+    """Ask the cheapest Gemini model where relevant channel context begins."""
+    if not candidates:
+        return -1
+    required_start = _reply_chain_start_index(candidates, referenced)
+    cheapest = pool.models[:1] if pool is not None and pool.models else None
+    try:
+        transcript = llm_history.format_boundary_transcript(
+            candidates, focus=referenced, requester_id=author_id)
+        raw, _ = await asyncio.wait_for(
+            gemini_api.complete(
+                pool,
+                llm_context.build_boundary_prompt(
+                    question, transcript, is_reply=referenced is not None,
+                    force_context=force_context,
+                    has_current_images=has_current_images,
+                    author_name=author_name, author_id=author_id,
+                    sent_at=sent_at),
+                system_instruction=llm_context.BOUNDARY_SELECTOR_INSTRUCTION,
+                max_output_tokens=_BOUNDARY_MAX_TOKENS,
+                temperature=0,
+                session=session,
+                models=cheapest,
+                stats=stats,
+                max_attempts=2,
+                tier=llm_models.LEAST,
+                response_mime_type='application/json',
+                response_schema=_BOUNDARY_SCHEMA),
+            timeout=getattr(
+                constants, 'LLM_BOUNDARY_TIMEOUT_SECONDS',
+                constants.LLM_ROUTER_TIMEOUT_SECONDS))
+    except (gemini_api.GeminiError, TimeoutError, ValueError) as err:
+        logger.warning(
+            'Gemini boundary selection failed (%s) — forwarding all '
+            'candidate messages', err)
+        return 0
+    start = parse_boundary(
+        raw, len(candidates), focus_index=required_start)
+    logger.info(
+        'Gemini selected context boundary start=%s of %s (required=%s)',
+        start, len(candidates), required_start)
+    return start
+
+
+def apply_boundary(candidates, start_index, referenced=None):
+    """Return the selected contiguous suffix, preserving a reply focus."""
+    if not candidates:
+        return []
+    required_start = _reply_chain_start_index(candidates, referenced)
+    start = parse_boundary(
+        {'start_index': start_index}, len(candidates),
+        focus_index=required_start)
+    if start == -1:
+        return []
+    return list(candidates[start:])
+
+
 async def gather(ctx, mode, referenced, bot_user_id=None, message_limit=None,
                  force_direct=False):
     """Collect the message window a mode calls for.
@@ -206,18 +350,23 @@ def build_prompt(question, referenced, window,
     """
     if referenced is not None:
         messages = list(window)
-        if not any(message is referenced for message in messages):
+        ref_token = llm_history._message_token(referenced)
+        if not any(llm_history._message_token(message) == ref_token
+                   for message in messages):
             messages.append(referenced)
+            messages.sort(key=llm_history._chronological_key)
         transcript = llm_history.format_transcript(
             messages, focus=referenced, structured=True,
-            requester_id=requester_id)
+            requester_id=requester_id,
+            max_chars=llm_history._MAX_SELECTED_TRANSCRIPT_CHARS)
         prompt = llm_context.build_context_prompt(
             question, transcript, is_reply=True)
         return _with_routing(_with_profiles(prompt, profiles), routing)
 
     if window:
         transcript = llm_history.format_transcript(
-            window, structured=True, requester_id=requester_id)
+            window, structured=True, requester_id=requester_id,
+            max_chars=llm_history._MAX_SELECTED_TRANSCRIPT_CHARS)
         if transcript.strip():
             prompt = llm_context.build_context_prompt(question, transcript)
             return _with_routing(_with_profiles(prompt, profiles), routing)

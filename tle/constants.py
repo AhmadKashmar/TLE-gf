@@ -159,12 +159,14 @@ XAI_OUTPUT_USD_PER_MILLION = max(
 XAI_DAILY_BUDGET_USD = max(
     0.0, _float_env('XAI_DAILY_BUDGET_USD', 0.50))
 XAI_REQUEST_RESERVE_INPUT_TOKENS = max(
-    1, _int_env('XAI_REQUEST_RESERVE_INPUT_TOKENS', 6000))
+    1, _int_env('XAI_REQUEST_RESERVE_INPUT_TOKENS', 50000))
 # One deadline covers history, attachments, router, fallbacks, and answer.
 LLM_REQUEST_TIMEOUT_SECONDS = max(
     1, _int_env('LLM_REQUEST_TIMEOUT_SECONDS', 90))
 LLM_ROUTER_TIMEOUT_SECONDS = max(
     1, _int_env('LLM_ROUTER_TIMEOUT_SECONDS', 15))
+LLM_BOUNDARY_TIMEOUT_SECONDS = max(
+    1, _int_env('LLM_BOUNDARY_TIMEOUT_SECONDS', 30))
 LLM_QUEUE_TIMEOUT_SECONDS = max(
     1, _int_env('LLM_QUEUE_TIMEOUT_SECONDS', 10))
 LLM_GEMINI_CONCURRENCY = max(1, _int_env('LLM_GEMINI_CONCURRENCY', 3))
@@ -186,11 +188,13 @@ LLM_MAX_OUTPUT_TOKENS = _int_env('LLM_MAX_OUTPUT_TOKENS', 2048)
 LLM_MAX_IMAGES = _int_env('LLM_MAX_IMAGES', 4)
 LLM_MAX_IMAGE_BYTES = _int_env('LLM_MAX_IMAGE_BYTES', 4 * 1024 * 1024)
 LLM_MAX_TOTAL_IMAGE_BYTES = _int_env('LLM_MAX_TOTAL_IMAGE_BYTES', 12 * 1024 * 1024)
-# Channel-history context. High-confidence requests route locally; only
-# ambiguous non-replies pay for a classifier. Guild/channel policy can further
-# restrict this to explicit requests or disable history entirely.
+# Channel-history context. The live path fetches a fixed candidate set and asks
+# the cheapest Gemini model for a semantic start boundary. Guild/channel policy
+# can still require explicit context or disable history entirely.
 LLM_CONTEXT_ENABLED = os.environ.get('LLM_CONTEXT_ENABLED', '1').strip() != '0'
-LLM_CONTEXT_MESSAGES = _int_env('LLM_CONTEXT_MESSAGES', 50)
+LLM_CONTEXT_MESSAGES = _int_env('LLM_CONTEXT_MESSAGES', 200)
+# Legacy collector settings retained for compatibility and focused tests. They
+# no longer cut the live Gemini/Grok answer path by age or inactivity.
 LLM_CONTEXT_WINDOW_SECONDS = _int_env('LLM_CONTEXT_WINDOW_SECONDS', 600)
 LLM_CONTEXT_GAP_SECONDS = _int_env('LLM_CONTEXT_GAP_SECONDS', 600)
 LLM_CONTEXT_RECENT_MAX_AGE_SECONDS = _int_env(
